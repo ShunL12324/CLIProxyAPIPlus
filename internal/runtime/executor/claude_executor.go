@@ -826,7 +826,10 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 
 	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
-	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
+	// Allow full override of betas from config
+	if hd.Betas != "" {
+		baseBetas = hd.Betas
+	} else if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
 		baseBetas = val
 		if !strings.Contains(val, "oauth") {
 			baseBetas += ",oauth-2025-04-20"
@@ -869,10 +872,10 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", "js")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Arch", mapStainlessArch())
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Os", mapStainlessOS())
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", hdrDefault(hd.Runtime, "node"))
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", hdrDefault(hd.Lang, "js"))
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Arch", hdrDefault(hd.Arch, mapStainlessArch()))
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Os", hdrDefault(hd.OS, mapStainlessOS()))
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
 	// For User-Agent, only forward the client's header if it's already a Claude Code client.
 	// Non-Claude-Code clients (e.g. curl, OpenAI SDKs) get the default Claude Code User-Agent
@@ -1324,8 +1327,17 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		payload = checkSystemInstructionsWithMode(payload, strictMode)
 	}
 
-	// Inject fake user ID
-	payload = injectFakeUserID(payload, apiKey, cacheUserID)
+	// Inject billing header as system prompt block 0 if configured
+	if cfg != nil && cfg.ClaudeHeaderDefaults.BillingHeader != "" {
+		payload = injectBillingHeaderBlock(payload, cfg.ClaudeHeaderDefaults.BillingHeader)
+	}
+
+	// Inject fixed user ID from config, or fall back to fake user ID
+	if cfg != nil && cfg.ClaudeHeaderDefaults.FixedUserID != "" {
+		payload = injectFixedUserID(payload, cfg.ClaudeHeaderDefaults.FixedUserID)
+	} else {
+		payload = injectFakeUserID(payload, apiKey, cacheUserID)
+	}
 
 	// Apply sensitive word obfuscation
 	if len(sensitiveWords) > 0 {

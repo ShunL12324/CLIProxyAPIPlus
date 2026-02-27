@@ -148,6 +148,13 @@ type ClaudeHeaderDefaults struct {
 	PackageVersion string `yaml:"package-version" json:"package-version"`
 	RuntimeVersion string `yaml:"runtime-version" json:"runtime-version"`
 	Timeout        string `yaml:"timeout" json:"timeout"`
+	OS             string `yaml:"os" json:"os"`
+	Arch           string `yaml:"arch" json:"arch"`
+	Lang           string `yaml:"lang" json:"lang"`
+	Runtime        string `yaml:"runtime" json:"runtime"`
+	BillingHeader  string `yaml:"billing-header" json:"billing-header"`
+	FixedUserID    string `yaml:"fixed-user-id" json:"fixed-user-id"`
+	Betas          string `yaml:"betas" json:"betas"`
 }
 
 // TLSConfig holds HTTPS server settings.
