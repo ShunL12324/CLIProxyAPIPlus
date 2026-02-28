@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -25,6 +28,10 @@ var userIDPattern = regexp.MustCompile(`^user_[a-fA-F0-9]{64}_account_[0-9a-f]{8
 // userIDBasePattern matches the fixed part: user_[64-hex]_account_[uuid]
 // Used to extract the base from fixed-user-id config and append a fresh session UUID.
 var userIDBasePattern = regexp.MustCompile(`^(user_[a-fA-F0-9]{64}_account_[0-9a-f-]+)_session_`)
+
+// userIDAccountPattern matches Claude Code format with account UUID:
+// user_[64-hex]_account_[uuid]_session_[uuid-v4]
+var userIDAccountPattern = regexp.MustCompile(`^user_[a-fA-F0-9]{64}_account_[0-9a-f-]+_session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // fixedSessionUUID caches the session UUID for the lifetime of the process,
 // mimicking real Claude Code which generates one session UUID per CLI invocation.
@@ -53,7 +60,7 @@ func generateFakeUserID() string {
 
 // isValidUserID checks if a user ID matches Claude Code format.
 func isValidUserID(userID string) bool {
-	return userIDPattern.MatchString(userID)
+	return userIDPattern.MatchString(userID) || userIDAccountPattern.MatchString(userID)
 }
 
 // injectFixedUserID injects a fixed user ID from config into the payload.
@@ -65,6 +72,93 @@ func injectFixedUserID(payload []byte, fixedUserID string) []byte {
 		finalID = matches[1] + "_session_" + getFixedSessionUUID()
 	}
 	payload, _ = sjson.SetBytes(payload, "metadata.user_id", finalID)
+	return payload
+}
+
+func authAccountUUID(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		for _, key := range []string{"account_uuid", "account-uuid", "accountUUID", "organization_uuid", "org_uuid"} {
+			if v, ok := auth.Metadata[key].(string); ok {
+				u := strings.TrimSpace(v)
+				if u != "" {
+					return u
+				}
+			}
+		}
+	}
+	if auth.Attributes != nil {
+		for _, key := range []string{"account_uuid", "account-uuid", "accountUUID", "organization_uuid", "org_uuid"} {
+			u := strings.TrimSpace(auth.Attributes[key])
+			if u != "" {
+				return u
+			}
+		}
+	}
+	return ""
+}
+
+func stableSessionUUIDFromSeed(seed string) string {
+	if strings.TrimSpace(seed) == "" {
+		return uuid.New().String()
+	}
+	sum := sha256.Sum256([]byte(seed))
+	b := make([]byte, 16)
+	copy(b, sum[:16])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return uuid.UUID(b).String()
+}
+
+func generateOAuthUserID(apiKey string, accountUUID string) string {
+	if accountUUID == "" {
+		return generateFakeUserID()
+	}
+	hashInput := apiKey + "|" + accountUUID
+	if strings.TrimSpace(apiKey) == "" {
+		hashInput = accountUUID
+	}
+	sum := sha256.Sum256([]byte(hashInput))
+	hexPart := hex.EncodeToString(sum[:])
+	session := uuid.New().String()
+	return "user_" + hexPart + "_account_" + accountUUID + "_session_" + session
+}
+
+func injectOAuthUserID(payload []byte, auth *cliproxyauth.Auth, apiKey string, cacheUserID bool) []byte {
+	metadata := gjson.GetBytes(payload, "metadata")
+	current := gjson.GetBytes(payload, "metadata.user_id").String()
+	if current != "" && isValidUserID(current) {
+		return payload
+	}
+
+	accountUUID := authAccountUUID(auth)
+	if accountUUID == "" {
+		return injectFakeUserID(payload, apiKey, cacheUserID)
+	}
+
+	baseUserID := generateOAuthUserID(apiKey, accountUUID)
+	if cacheUserID {
+		keySeed := strings.TrimSpace(apiKey)
+		if keySeed == "" && auth != nil {
+			keySeed = strings.TrimSpace(auth.ID)
+		}
+		if keySeed == "" {
+			keySeed = accountUUID
+		}
+		ttlBucket := strconv.FormatInt(time.Now().Unix()/(15*60), 10)
+		session := stableSessionUUIDFromSeed(keySeed + "|" + accountUUID + "|" + ttlBucket)
+		if matches := userIDBasePattern.FindStringSubmatch(baseUserID); len(matches) > 1 {
+			baseUserID = matches[1] + "_session_" + session
+		}
+	}
+
+	if !metadata.Exists() {
+		payload, _ = sjson.SetBytes(payload, "metadata.user_id", baseUserID)
+		return payload
+	}
+	payload, _ = sjson.SetBytes(payload, "metadata.user_id", baseUserID)
 	return payload
 }
 

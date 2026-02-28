@@ -17,6 +17,10 @@ type ClaudeTokenData struct {
 	RefreshToken string `json:"refresh_token"`
 	// Email is the Anthropic account email
 	Email string `json:"email"`
+	// AccountUUID is the Anthropic account UUID associated with the token.
+	AccountUUID string `json:"account_uuid,omitempty"`
+	// OrganizationUUID is the Anthropic organization UUID associated with the token.
+	OrganizationUUID string `json:"organization_uuid,omitempty"`
 	// Expire is the timestamp of the token expire
 	Expire string `json:"expired"`
 }

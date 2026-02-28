@@ -49,6 +49,36 @@ func TestApplyClaudeToolPrefix_WithToolReference(t *testing.T) {
 	}
 }
 
+func TestBuildClaudeBetaHeader_MimicIncludesClaudeCode(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Anthropic-Beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14")
+	got := buildClaudeBetaHeader("", headers, []string{"custom-beta-1"}, false)
+	if !strings.Contains(got, "claude-code-20250219") {
+		t.Fatalf("expected claude-code beta in mimic mode, got %q", got)
+	}
+	if !strings.Contains(got, "oauth-2025-04-20") {
+		t.Fatalf("expected oauth beta, got %q", got)
+	}
+	if !strings.Contains(got, "prompt-caching-2024-07-31") {
+		t.Fatalf("expected prompt caching beta, got %q", got)
+	}
+	if !strings.Contains(got, "custom-beta-1") {
+		t.Fatalf("expected extra beta, got %q", got)
+	}
+}
+
+func TestBuildClaudeBetaHeader_RealClientKeepsRequiredOnly(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Anthropic-Beta", "interleaved-thinking-2025-05-14")
+	got := buildClaudeBetaHeader("", headers, nil, true)
+	if !strings.Contains(got, "oauth-2025-04-20") {
+		t.Fatalf("expected oauth beta, got %q", got)
+	}
+	if !strings.Contains(got, "prompt-caching-2024-07-31") {
+		t.Fatalf("expected prompt caching beta, got %q", got)
+	}
+}
+
 func TestApplyClaudeToolPrefix_SkipsBuiltinTools(t *testing.T) {
 	input := []byte(`{"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"my_custom_tool","input_schema":{"type":"object"}}]}`)
 	out := applyClaudeToolPrefix(input, "proxy_")

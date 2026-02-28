@@ -185,6 +185,22 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		recordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
+	if httpResp.StatusCode == http.StatusUnauthorized && isClaudeOAuthToken(apiKey) {
+		retryResp, retryErr := e.refreshAndRetryMessagesRequest(ctx, auth, req, opts, false)
+		if retryErr == nil {
+			_ = httpResp.Body.Close()
+			httpResp = retryResp
+		} else {
+			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+			b, _ := io.ReadAll(httpResp.Body)
+			appendAPIResponseChunk(ctx, e.cfg, b)
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("response body close error: %v", errClose)
+			}
+			err = retryErr
+			return resp, err
+		}
+	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
@@ -347,6 +363,22 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
+	}
+	if httpResp.StatusCode == http.StatusUnauthorized && isClaudeOAuthToken(apiKey) {
+		retryResp, retryErr := e.refreshAndRetryMessagesRequest(ctx, auth, req, opts, true)
+		if retryErr == nil {
+			_ = httpResp.Body.Close()
+			httpResp = retryResp
+		} else {
+			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+			b, _ := io.ReadAll(httpResp.Body)
+			appendAPIResponseChunk(ctx, e.cfg, b)
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("response body close error: %v", errClose)
+			}
+			err = retryErr
+			return nil, err
+		}
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -515,6 +547,21 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		recordAPIResponseError(ctx, e.cfg, err)
 		return cliproxyexecutor.Response{}, err
 	}
+	if resp.StatusCode == http.StatusUnauthorized && isClaudeOAuthToken(apiKey) {
+		retryResp, retryErr := e.refreshAndRetryCountTokensRequest(ctx, auth, req, opts)
+		if retryErr == nil {
+			_ = resp.Body.Close()
+			resp = retryResp
+		} else {
+			recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
+			b, _ := io.ReadAll(resp.Body)
+			appendAPIResponseChunk(ctx, e.cfg, b)
+			if errClose := resp.Body.Close(); errClose != nil {
+				log.Errorf("response body close error: %v", errClose)
+			}
+			return cliproxyexecutor.Response{}, retryErr
+		}
+	}
 	recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
@@ -591,11 +638,166 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 		auth.Metadata["refresh_token"] = td.RefreshToken
 	}
 	auth.Metadata["email"] = td.Email
+	if td.AccountUUID != "" {
+		auth.Metadata["account_uuid"] = td.AccountUUID
+	}
+	if td.OrganizationUUID != "" {
+		auth.Metadata["organization_uuid"] = td.OrganizationUUID
+	}
 	auth.Metadata["expired"] = td.Expire
 	auth.Metadata["type"] = "claude"
 	now := time.Now().Format(time.RFC3339)
 	auth.Metadata["last_refresh"] = now
+	auth.LastRefreshedAt = time.Now().UTC()
+	if expiresAt, parseErr := time.Parse(time.RFC3339, td.Expire); parseErr == nil {
+		auth.NextRefreshAfter = expiresAt.Add(-4 * time.Hour)
+	} else {
+		auth.NextRefreshAfter = time.Time{}
+	}
+	auth.NextRetryAfter = time.Time{}
+	auth.Unavailable = false
+	auth.Status = cliproxyauth.StatusActive
+	auth.StatusMessage = ""
+	auth.UpdatedAt = time.Now().UTC()
 	return auth, nil
+}
+
+// refreshAndRetryMessagesRequest refreshes the OAuth token inline and replays
+// the messages request. The request-building logic below mirrors Execute() /
+// ExecuteStream() and must be kept in sync when merging upstream changes.
+func (e *ClaudeExecutor) refreshAndRetryMessagesRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*http.Response, error) {
+	if auth == nil {
+		return nil, fmt.Errorf("claude executor: auth is nil for retry")
+	}
+	refreshToken := ""
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["refresh_token"].(string); ok {
+			refreshToken = strings.TrimSpace(v)
+		}
+	}
+	if refreshToken == "" {
+		return nil, statusErr{code: http.StatusUnauthorized, msg: "oauth token expired and refresh_token missing"}
+	}
+	refreshedAuth, err := e.Refresh(ctx, auth)
+	if err != nil {
+		return nil, err
+	}
+	if refreshedAuth != nil {
+		if refreshedAuth.Metadata != nil {
+			auth.Metadata = refreshedAuth.Metadata
+		}
+		auth.LastRefreshedAt = refreshedAuth.LastRefreshedAt
+		auth.NextRefreshAfter = refreshedAuth.NextRefreshAfter
+		auth.NextRetryAfter = refreshedAuth.NextRetryAfter
+		auth.Unavailable = refreshedAuth.Unavailable
+		auth.Status = refreshedAuth.Status
+		auth.StatusMessage = refreshedAuth.StatusMessage
+		auth.UpdatedAt = refreshedAuth.UpdatedAt
+	}
+	apiKey, baseURL := claudeCreds(auth)
+	if baseURL == "" {
+		baseURL = "https://api.anthropic.com"
+	}
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("claude")
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
+	}
+	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayloadSource, stream)
+	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
+	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	if err != nil {
+		return nil, err
+	}
+	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	requestedModel := payloadRequestedModel(opts, req.Model)
+	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = disableThinkingIfToolChoiceForced(body)
+	if countCacheControls(body) == 0 {
+		body = ensureCacheControl(body)
+	}
+	extraBetas, body := extractAndRemoveBetas(body)
+	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
+		body = applyClaudeToolPrefix(body, claudeToolPrefix)
+	}
+	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	applyClaudeHeaders(httpReq, auth, apiKey, stream, extraBetas, e.cfg)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// refreshAndRetryCountTokensRequest refreshes the OAuth token inline and
+// replays the count_tokens request. The request-building logic below mirrors
+// CountTokens() and must be kept in sync when merging upstream changes.
+func (e *ClaudeExecutor) refreshAndRetryCountTokensRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*http.Response, error) {
+	if auth == nil {
+		return nil, fmt.Errorf("claude executor: auth is nil for count_tokens retry")
+	}
+	refreshToken := ""
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["refresh_token"].(string); ok {
+			refreshToken = strings.TrimSpace(v)
+		}
+	}
+	if refreshToken == "" {
+		return nil, statusErr{code: http.StatusUnauthorized, msg: "oauth token expired and refresh_token missing"}
+	}
+	refreshedAuth, err := e.Refresh(ctx, auth)
+	if err != nil {
+		return nil, err
+	}
+	if refreshedAuth != nil {
+		if refreshedAuth.Metadata != nil {
+			auth.Metadata = refreshedAuth.Metadata
+		}
+		auth.LastRefreshedAt = refreshedAuth.LastRefreshedAt
+		auth.NextRefreshAfter = refreshedAuth.NextRefreshAfter
+		auth.NextRetryAfter = refreshedAuth.NextRetryAfter
+		auth.Unavailable = refreshedAuth.Unavailable
+		auth.Status = refreshedAuth.Status
+		auth.StatusMessage = refreshedAuth.StatusMessage
+		auth.UpdatedAt = refreshedAuth.UpdatedAt
+	}
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	apiKey, baseURL := claudeCreds(auth)
+	if baseURL == "" {
+		baseURL = "https://api.anthropic.com"
+	}
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("claude")
+	stream := from != to
+	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
+	body, _ = sjson.SetBytes(body, "model", baseModel)
+	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+		body = checkSystemInstructions(body)
+	}
+	extraBetas, body := extractAndRemoveBetas(body)
+	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
+		body = applyClaudeToolPrefix(body, claudeToolPrefix)
+	}
+	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // extractAndRemoveBetas extracts the "betas" array from the body and removes it.
@@ -617,6 +819,72 @@ func extractAndRemoveBetas(body []byte) ([]string, []byte) {
 	}
 	body, _ = sjson.DeleteBytes(body, "betas")
 	return betas, body
+}
+
+func splitAnthropicBeta(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func buildClaudeBetaHeader(cfgBetas string, ginHeaders http.Header, extraBetas []string, isRealClaudeCodeClient bool) string {
+	requiredOAuthBeta := "oauth-2025-04-20"
+	base := splitAnthropicBeta("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05")
+
+	if trimmed := strings.TrimSpace(cfgBetas); trimmed != "" {
+		base = splitAnthropicBeta(trimmed)
+	} else if ginHeaders != nil {
+		if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
+			base = splitAnthropicBeta(val)
+		}
+	}
+
+	hasClaude1MHeader := false
+	if ginHeaders != nil {
+		if _, ok := ginHeaders[textproto.CanonicalMIMEHeaderKey("X-CPA-CLAUDE-1M")]; ok {
+			hasClaude1MHeader = true
+		}
+	}
+
+	merged := make([]string, 0, len(base)+len(extraBetas)+2)
+	seen := make(map[string]struct{}, len(base)+len(extraBetas)+4)
+	add := func(token string) {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			return
+		}
+		if _, exists := seen[token]; exists {
+			return
+		}
+		seen[token] = struct{}{}
+		merged = append(merged, token)
+	}
+
+	for _, b := range base {
+		add(b)
+	}
+	for _, b := range extraBetas {
+		add(b)
+	}
+	if hasClaude1MHeader {
+		add("context-1m-2025-08-07")
+	}
+	add(requiredOAuthBeta)
+	if !isRealClaudeCodeClient {
+		add("claude-code-20250219")
+	}
+
+	return strings.Join(merged, ",")
 }
 
 // disableThinkingIfToolChoiceForced checks if tool_choice forces tool use and disables thinking.
@@ -820,50 +1088,15 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 	r.Header.Set("Content-Type", "application/json")
 
+	clientUserAgent := ""
 	var ginHeaders http.Header
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header
+		clientUserAgent = ginCtx.GetHeader("User-Agent")
 	}
 
-	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
-	// Allow full override of betas from config
-	if hd.Betas != "" {
-		baseBetas = hd.Betas
-	} else if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
-		baseBetas = val
-		if !strings.Contains(val, "oauth") {
-			baseBetas += ",oauth-2025-04-20"
-		}
-	}
-
-	hasClaude1MHeader := false
-	if ginHeaders != nil {
-		if _, ok := ginHeaders[textproto.CanonicalMIMEHeaderKey("X-CPA-CLAUDE-1M")]; ok {
-			hasClaude1MHeader = true
-		}
-	}
-
-	// Merge extra betas from request body and request flags.
-	if len(extraBetas) > 0 || hasClaude1MHeader {
-		existingSet := make(map[string]bool)
-		for _, b := range strings.Split(baseBetas, ",") {
-			betaName := strings.TrimSpace(b)
-			if betaName != "" {
-				existingSet[betaName] = true
-			}
-		}
-		for _, beta := range extraBetas {
-			beta = strings.TrimSpace(beta)
-			if beta != "" && !existingSet[beta] {
-				baseBetas += "," + beta
-				existingSet[beta] = true
-			}
-		}
-		if hasClaude1MHeader && !existingSet["context-1m-2025-08-07"] {
-			baseBetas += ",context-1m-2025-08-07"
-		}
-	}
-	r.Header.Set("Anthropic-Beta", baseBetas)
+	anthropicBeta := buildClaudeBetaHeader(hd.Betas, ginHeaders, extraBetas, isClaudeCodeClient(clientUserAgent))
+	r.Header.Set("Anthropic-Beta", anthropicBeta)
 
 	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Version", "2023-06-01")
 	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
@@ -1317,32 +1550,40 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		cacheUserID = attrCache
 	}
 
-	// Determine if cloaking should be applied
-	if !shouldCloak(cloakMode, clientUserAgent) {
-		return payload
+	shouldApplyCloak := shouldCloak(cloakMode, clientUserAgent)
+	if shouldApplyCloak {
+		// Skip system instructions for claude-3-5-haiku models
+		if !strings.HasPrefix(model, "claude-3-5-haiku") {
+			payload = checkSystemInstructionsWithMode(payload, strictMode)
+		}
+
+		// Inject billing header as system prompt block 0 if configured
+		if cfg != nil && cfg.ClaudeHeaderDefaults.BillingHeader != "" {
+			payload = injectBillingHeaderBlock(payload, cfg.ClaudeHeaderDefaults.BillingHeader)
+		}
+
+		// Apply sensitive word obfuscation
+		if len(sensitiveWords) > 0 {
+			matcher := buildSensitiveWordMatcher(sensitiveWords)
+			payload = obfuscateSensitiveWords(payload, matcher)
+		}
 	}
 
-	// Skip system instructions for claude-3-5-haiku models
-	if !strings.HasPrefix(model, "claude-3-5-haiku") {
-		payload = checkSystemInstructionsWithMode(payload, strictMode)
-	}
-
-	// Inject billing header as system prompt block 0 if configured
-	if cfg != nil && cfg.ClaudeHeaderDefaults.BillingHeader != "" {
-		payload = injectBillingHeaderBlock(payload, cfg.ClaudeHeaderDefaults.BillingHeader)
-	}
-
-	// Inject fixed user ID from config, or fall back to fake user ID
-	if cfg != nil && cfg.ClaudeHeaderDefaults.FixedUserID != "" {
-		payload = injectFixedUserID(payload, cfg.ClaudeHeaderDefaults.FixedUserID)
-	} else {
-		payload = injectFakeUserID(payload, apiKey, cacheUserID)
-	}
-
-	// Apply sensitive word obfuscation
-	if len(sensitiveWords) > 0 {
-		matcher := buildSensitiveWordMatcher(sensitiveWords)
-		payload = obfuscateSensitiveWords(payload, matcher)
+	// Always normalize user_id for OAuth tokens to keep identity stable,
+	// even when request is from real Claude Code and cloaking is not applied.
+	if isClaudeOAuthToken(apiKey) {
+		if cfg != nil && cfg.ClaudeHeaderDefaults.FixedUserID != "" {
+			payload = injectFixedUserID(payload, cfg.ClaudeHeaderDefaults.FixedUserID)
+		} else {
+			payload = injectOAuthUserID(payload, auth, apiKey, cacheUserID)
+		}
+	} else if shouldApplyCloak {
+		// Non-OAuth path keeps legacy behavior.
+		if cfg != nil && cfg.ClaudeHeaderDefaults.FixedUserID != "" {
+			payload = injectFixedUserID(payload, cfg.ClaudeHeaderDefaults.FixedUserID)
+		} else {
+			payload = injectFakeUserID(payload, apiKey, cacheUserID)
+		}
 	}
 
 	return payload
