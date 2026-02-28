@@ -63,15 +63,33 @@ func isValidUserID(userID string) bool {
 	return userIDPattern.MatchString(userID) || userIDAccountPattern.MatchString(userID)
 }
 
+// userIDSessionPattern extracts the session UUID from a user_id string.
+var userIDSessionPattern = regexp.MustCompile(`_session_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
+
 // injectFixedUserID injects a fixed user ID from config into the payload.
-// The session UUID is generated once per process lifetime, mimicking real Claude Code
-// which generates one session UUID per CLI invocation.
+// The user hash and account UUID come from config; the session UUID is
+// passthrough from the client when available, falling back to a process-level
+// fixed UUID otherwise.
 func injectFixedUserID(payload []byte, fixedUserID string) []byte {
-	finalID := fixedUserID
-	if matches := userIDBasePattern.FindStringSubmatch(fixedUserID); len(matches) > 1 {
-		finalID = matches[1] + "_session_" + getFixedSessionUUID()
+	baseMatch := userIDBasePattern.FindStringSubmatch(fixedUserID)
+	if len(baseMatch) <= 1 {
+		payload, _ = sjson.SetBytes(payload, "metadata.user_id", fixedUserID)
+		return payload
 	}
-	payload, _ = sjson.SetBytes(payload, "metadata.user_id", finalID)
+	base := baseMatch[1] // user_{hash}_account_{uuid}
+
+	// Try to passthrough the client's session UUID.
+	session := ""
+	if current := gjson.GetBytes(payload, "metadata.user_id").String(); current != "" {
+		if m := userIDSessionPattern.FindStringSubmatch(current); len(m) > 1 {
+			session = m[1]
+		}
+	}
+	if session == "" {
+		session = getFixedSessionUUID()
+	}
+
+	payload, _ = sjson.SetBytes(payload, "metadata.user_id", base+"_session_"+session)
 	return payload
 }
 

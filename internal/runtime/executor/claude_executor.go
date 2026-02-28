@@ -1101,7 +1101,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Version", "2023-06-01")
 	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-App", "cli")
-	// Values below match Claude Code 2.1.63 / @anthropic-ai/sdk 0.74.0 (updated 2026-02-28).
+	// Values below match Claude Code 2.1.63 / @anthropic-ai/sdk 0.74.0 (captured 2026-02-28).
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
@@ -1131,8 +1131,10 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		r.Header.Set("Accept-Encoding", "identity")
 	} else {
 		r.Header.Set("Accept", "application/json")
-		r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+		r.Header.Set("Accept-Encoding", "br, gzip, deflate")
 	}
+	r.Header.Set("Accept-Language", "*")
+	r.Header.Set("Sec-Fetch-Mode", "cors")
 	// Keep OS/Arch mapping dynamic (not configurable).
 	// They intentionally continue to derive from runtime.GOOS/runtime.GOARCH.
 	var attrs map[string]string
@@ -1577,6 +1579,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		} else {
 			payload = injectOAuthUserID(payload, auth, apiKey, cacheUserID)
 		}
+		log.Debugf("applyCloaking: final user_id=%s", gjson.GetBytes(payload, "metadata.user_id").String())
 	} else if shouldApplyCloak {
 		// Non-OAuth path keeps legacy behavior.
 		if cfg != nil && cfg.ClaudeHeaderDefaults.FixedUserID != "" {
