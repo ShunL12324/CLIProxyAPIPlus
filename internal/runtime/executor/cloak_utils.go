@@ -2,8 +2,10 @@ package executor
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 	"sync"
@@ -12,6 +14,10 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// billingHashSalt is the constant salt used by Claude Code to compute
+// the cc_version suffix hash.
+const billingHashSalt = "59cf53e54c78"
 
 // userIDPattern matches Claude Code format: user_[64-hex]_account_[uuid]_session_[uuid]
 var userIDPattern = regexp.MustCompile(`^user_[a-fA-F0-9]{64}_account_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -62,8 +68,70 @@ func injectFixedUserID(payload []byte, fixedUserID string) []byte {
 	return payload
 }
 
+// computeBillingVersionSuffix computes the 3-char hex suffix for cc_version
+// using the same algorithm as real Claude Code:
+//  1. Extract the first user message text from the conversation
+//  2. Take characters at positions 4, 7, 20 (0-indexed), defaulting to "0"
+//  3. Compute SHA-256 of: salt + chars + version
+//  4. Return first 3 hex characters of the hash
+func computeBillingVersionSuffix(payload []byte, version string) string {
+	// Extract first user message text from messages array
+	firstUserText := extractFirstUserMessageText(payload)
+
+	// Take characters at positions 4, 7, 20
+	charAtPos := func(s string, pos int) string {
+		if pos < len(s) {
+			return string(s[pos])
+		}
+		return "0"
+	}
+	chars := charAtPos(firstUserText, 4) + charAtPos(firstUserText, 7) + charAtPos(firstUserText, 20)
+
+	// SHA-256 hash of: salt + chars + version
+	input := billingHashSalt + chars + version
+	hash := sha256.Sum256([]byte(input))
+	return fmt.Sprintf("%x", hash[:])[:3]
+}
+
+// extractFirstUserMessageText extracts the text content from the first user
+// message in the messages array, matching Claude Code's behavior.
+func extractFirstUserMessageText(payload []byte) string {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return ""
+	}
+
+	var firstUserText string
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() != "user" {
+			return true // continue
+		}
+		content := msg.Get("content")
+		if content.Type == gjson.String {
+			firstUserText = content.String()
+			return false // break
+		}
+		if content.IsArray() {
+			content.ForEach(func(_, block gjson.Result) bool {
+				if block.Get("type").String() == "text" {
+					firstUserText = block.Get("text").String()
+					return false // break
+				}
+				return true
+			})
+			return false // break
+		}
+		return true
+	})
+	return firstUserText
+}
+
+// ccVersionSuffixPattern matches the version suffix in billing headers, e.g. "2.1.63.68f"
+var ccVersionSuffixPattern = regexp.MustCompile(`(cc_version=\d+\.\d+\.\d+)\.([0-9a-f]{3})`)
+
 // injectBillingHeaderBlock injects the x-anthropic-billing-header as system prompt block 0.
 // Real Claude Code sends this as the first system block with no cache_control.
+// The cc_version suffix is dynamically computed per-request to match Claude Code behavior.
 func injectBillingHeaderBlock(payload []byte, billingHeader string) []byte {
 	system := gjson.GetBytes(payload, "system")
 	if !system.Exists() || !system.IsArray() {
@@ -76,10 +144,21 @@ func injectBillingHeaderBlock(payload []byte, billingHeader string) []byte {
 		return payload
 	}
 
+	// Dynamically compute the cc_version suffix if the billing header contains
+	// a version pattern like "cc_version=2.1.63.xxx"
+	finalHeader := billingHeader
+	if matches := ccVersionSuffixPattern.FindStringSubmatch(billingHeader); len(matches) == 3 {
+		// Extract the base version (e.g. "2.1.63") from the full match
+		baseVersionPrefix := matches[1] // "cc_version=2.1.63"
+		baseVersion := strings.TrimPrefix(baseVersionPrefix, "cc_version=")
+		suffix := computeBillingVersionSuffix(payload, baseVersion)
+		finalHeader = ccVersionSuffixPattern.ReplaceAllString(billingHeader, "${1}."+suffix)
+	}
+
 	// Build new block and prepend to system array
 	billingBlock := map[string]string{
 		"type": "text",
-		"text": billingHeader,
+		"text": finalHeader,
 	}
 
 	// Get existing blocks
