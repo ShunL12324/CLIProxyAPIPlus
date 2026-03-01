@@ -192,40 +192,18 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			httpResp = retryResp
 		} else {
 			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-			b, _ := io.ReadAll(httpResp.Body)
+			b := readErrorBody(httpResp)
 			appendAPIResponseChunk(ctx, e.cfg, b)
-			if errClose := httpResp.Body.Close(); errClose != nil {
-				log.Errorf("response body close error: %v", errClose)
-			}
 			err = retryErr
 			return resp, err
 		}
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		// Decompress error responses — pass the Content-Encoding value (may be empty)
-		// and let decodeResponseBody handle both header-declared and magic-byte-detected
-		// compression.  This keeps error-path behaviour consistent with the success path.
-		errBody, decErr := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
-		if decErr != nil {
-			recordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			logWithRequestID(ctx).Warn(msg)
-			return resp, statusErr{code: httpResp.StatusCode, msg: msg}
-		}
-		b, readErr := io.ReadAll(errBody)
-		if readErr != nil {
-			recordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			logWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
-		}
+		b := readErrorBody(httpResp)
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		if errClose := errBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
 		return resp, err
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
@@ -371,39 +349,17 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			httpResp = retryResp
 		} else {
 			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-			b, _ := io.ReadAll(httpResp.Body)
+			b := readErrorBody(httpResp)
 			appendAPIResponseChunk(ctx, e.cfg, b)
-			if errClose := httpResp.Body.Close(); errClose != nil {
-				log.Errorf("response body close error: %v", errClose)
-			}
 			err = retryErr
 			return nil, err
 		}
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		// Decompress error responses — pass the Content-Encoding value (may be empty)
-		// and let decodeResponseBody handle both header-declared and magic-byte-detected
-		// compression.  This keeps error-path behaviour consistent with the success path.
-		errBody, decErr := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
-		if decErr != nil {
-			recordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			logWithRequestID(ctx).Warn(msg)
-			return nil, statusErr{code: httpResp.StatusCode, msg: msg}
-		}
-		b, readErr := io.ReadAll(errBody)
-		if readErr != nil {
-			recordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			logWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
-		}
+		b := readErrorBody(httpResp)
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if errClose := errBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return nil, err
 	}
@@ -554,37 +510,15 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 			resp = retryResp
 		} else {
 			recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
-			b, _ := io.ReadAll(resp.Body)
+			b := readErrorBody(resp)
 			appendAPIResponseChunk(ctx, e.cfg, b)
-			if errClose := resp.Body.Close(); errClose != nil {
-				log.Errorf("response body close error: %v", errClose)
-			}
 			return cliproxyexecutor.Response{}, retryErr
 		}
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Decompress error responses — pass the Content-Encoding value (may be empty)
-		// and let decodeResponseBody handle both header-declared and magic-byte-detected
-		// compression.  This keeps error-path behaviour consistent with the success path.
-		errBody, decErr := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
-		if decErr != nil {
-			recordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			logWithRequestID(ctx).Warn(msg)
-			return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: msg}
-		}
-		b, readErr := io.ReadAll(errBody)
-		if readErr != nil {
-			recordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			logWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
-		}
+		b := readErrorBody(resp)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		if errClose := errBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
 		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b)}
 	}
 	decodedBody, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
@@ -933,6 +867,26 @@ type peekableBody struct {
 
 func (p *peekableBody) Close() error {
 	return p.closer.Close()
+}
+
+// readErrorBody reads the error response body, decompressing it if needed.
+// When Accept-Encoding is set explicitly, Go's HTTP client does not auto-decompress,
+// so error paths must decompress manually to avoid returning garbled binary data.
+func readErrorBody(resp *http.Response) []byte {
+	if resp == nil || resp.Body == nil {
+		return nil
+	}
+	reader, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
+	if err != nil {
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return b
+	}
+	b, _ := io.ReadAll(reader)
+	if errClose := reader.Close(); errClose != nil {
+		log.Errorf("response body close error: %v", errClose)
+	}
+	return b
 }
 
 func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadCloser, error) {
